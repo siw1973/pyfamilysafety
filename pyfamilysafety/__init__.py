@@ -25,6 +25,11 @@ class FamilySafety:
         experimental: When ``True``, :meth:`update` fetches pending screen-time
             requests and invokes registered callbacks.
         pending_requests: Latest pending request payloads (experimental mode).
+        unresolvable_devices: Non-empty when the family roster contains one or
+            more entries that Microsoft cannot resolve (e.g. a device enrolled
+            in an Entra ID / school MDM tenant, or a decommissioned device).
+            Callers can surface this to users with a prompt to visit
+            https://account.microsoft.com/family and remove the stale entry.
     """
 
     def __init__(self, auth: Authenticator) -> None:
@@ -39,6 +44,18 @@ class FamilySafety:
         self.experimental: bool = False
         self.pending_requests = []
         self._pending_request_callbacks = []
+
+    @property
+    def unresolvable_devices(self) -> list[str]:
+        """Roster entries that Microsoft cannot resolve.
+
+        Populated by :meth:`update` via
+        :meth:`~pyfamilysafety.api.FamilySafetyAPI.async_get_accounts`.
+        Non-empty means at least one family-roster device is unresolvable;
+        the list contains sentinel strings rather than real device IDs because
+        Microsoft does not report which specific device caused the failure.
+        """
+        return self._api.unresolvable_devices
 
     def get_account(self, user_id: str) -> Account:
         """Return the account with the given member ID.
@@ -169,13 +186,19 @@ class FamilySafety:
         instances. On every call, runs :meth:`Account.update` for each member.
         When :attr:`experimental` is enabled, also refreshes pending requests.
 
+        Uses :meth:`~pyfamilysafety.api.FamilySafetyAPI.async_get_accounts`
+        rather than ``send_request`` directly so that stale-roster tolerance
+        (Entra ID / MDM devices, decommissioned devices) is always active.
+        Check :attr:`unresolvable_devices` after calling to determine whether
+        any roster entries were suppressed.
+
         Raises:
             AggregatorException: Not raised directly; transient aggregator errors
                 are logged and ignored so cached data remains available.
         """
         try:
             if len(self.accounts) == 0:
-                data = await self._api.send_request("get_accounts")
+                data = await self._api.async_get_accounts()
                 self.accounts = await Account.from_dict(
                     self._api,
                     data["json"],
