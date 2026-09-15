@@ -12,6 +12,19 @@ from .exceptions import HttpException, AggregatorException, Unauthorized, Reques
 
 _LOGGER = logging.getLogger(__name__)
 
+# Error text fragments (lowercased) that indicate a family-roster entry
+# references a device Microsoft cannot resolve — typically an Entra ID /
+# school MDM enrolment or a decommissioned device that was never removed
+# from the roster.  When any of these appear in a HttpException raised by
+# get_accounts, the call is suppressed and an empty member list is returned
+# so callers can continue with partial data.
+_STALE_ROSTER_MARKERS = (
+    "unabletofindtargetresource",
+    "rostererror",
+    "unable to find the node",
+)
+
+
 def _check_http_success(status: int) -> bool:
     return status >= 200 and status < 300
 
@@ -22,6 +35,17 @@ class FamilySafetyAPI:
         """Init API."""
         self._auth: Authenticator = auth
         self.pending_requests = []
+        # Populated when async_get_accounts() catches a stale-roster error.
+        # Contains sentinel strings (not resolvable device IDs — Microsoft
+        # does not report which device caused the failure).  Non-empty means
+        # at least one roster entry is unresolvable; callers can surface a
+        # Repairs / notification to the user.
+        self.unresolvable_devices: list[str] = []
+
+    @property
+    def has_unresolvable_devices(self) -> bool:
+        """True when the last get_accounts call hit a stale-roster error."""
+        return len(self.unresolvable_devices) > 0
 
     async def send_request(self, endpoint: str, body: object=None, headers: dict=None, platform: str=None, **kwargs):
         """Sends a request to a given endpoint."""
@@ -88,8 +112,43 @@ class FamilySafetyAPI:
         return resp
 
     async def async_get_accounts(self):
-        """Retrieve data from endpoint get_accounts."""
-        return await self.send_request("get_accounts")
+        """Retrieve data from endpoint get_accounts.
+
+        Tolerates roster entries that Microsoft cannot resolve (e.g. devices
+        enrolled in an Entra ID / school MDM tenant, or decommissioned
+        devices still present in the family roster).  When such an error is
+        detected the exception is suppressed, ``unresolvable_devices`` is
+        updated, and an empty-members response dict is returned so the caller
+        can continue with partial data rather than failing entirely.
+
+        To resolve the underlying issue, remove the unresolvable device from
+        the family at https://account.microsoft.com/family.
+        """
+        try:
+            return await self.send_request("get_accounts")
+        except HttpException as exc:
+            text = str(exc).lower()
+            if any(marker in text for marker in _STALE_ROSTER_MARKERS):
+                _LOGGER.warning(
+                    "Roster resolution error suppressed in async_get_accounts. "
+                    "One or more devices in the family roster cannot be resolved "
+                    "by Microsoft (likely enrolled in an Entra ID / school MDM "
+                    "tenant, or a decommissioned device that was not removed from "
+                    "the roster). Returning an empty member list so the caller can "
+                    "continue with partial data. To fix this, remove the "
+                    "unresolvable device at https://account.microsoft.com/family"
+                )
+                # Microsoft does not report which device caused the failure, so
+                # we record a sentinel rather than a real device identifier.
+                if "unresolvable_roster_entry" not in self.unresolvable_devices:
+                    self.unresolvable_devices.append("unresolvable_roster_entry")
+                return {
+                    "status": 200,
+                    "text": '{"members": []}',
+                    "json": {"members": []},
+                    "headers": {},
+                }
+            raise
 
     async def async_get_pending_requests(self):
         """Retrieve data from endpoint get_pending_requests."""
