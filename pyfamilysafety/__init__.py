@@ -5,7 +5,7 @@ import logging
 
 from .api import FamilySafetyAPI
 from .account import Account
-from .exceptions import AggregatorException
+from .exceptions import AggregatorException, HttpException
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,8 +24,23 @@ class FamilySafety:
                      experimental: bool=False) -> 'FamilySafety':
         """Create an instance of the family safety module."""
         self = cls(await FamilySafetyAPI.create(token, use_refresh_token))
-        accounts = await self.api.async_get_accounts()
-        self.accounts = await Account.from_dict(self.api, accounts.get("json"), experimental)
+        try:
+            accounts = await self.api.async_get_accounts()
+            self.accounts = await Account.from_dict(self.api, accounts.get("json"), experimental)
+        except HttpException as exc:
+            text = str(exc).lower()
+            if any(m in text for m in (
+                "unabletofindtargetresource", "rostererror", "unable to find the node"
+            )):
+                _LOGGER.warning(
+                    "Family Safety: roster fetch failed with stale-device error "
+                    "(likely a decommissioned or Entra ID school/work device still "
+                    "listed in the family roster) — starting with empty accounts. (%s)",
+                    exc,
+                )
+                self.accounts = []
+            else:
+                raise
         self.experimental = experimental
         if experimental:
             await self._get_pending_requests()
