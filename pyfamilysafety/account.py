@@ -21,6 +21,22 @@ _STALE_ROSTER_MARKERS = (
     "unable to find the node",
 )
 
+# Tracks (user_id, endpoint) pairs that have already emitted a WARNING so that
+# subsequent update cycles downgrade to DEBUG, avoiding log spam.
+_ROSTER_WARNED: set[tuple[str, str]] = set()
+
+
+def _empty_screentime_report() -> dict:
+    """Return an empty screentime report matching the real API response shape."""
+    return {
+        "deviceUsageAggregates": {
+            "deviceAggregates": [],
+            "totalScreenTime": 0,
+            "dailyAverage": 0,
+        }
+    }
+
+
 class Account:
     """Represents a single family safety account."""
 
@@ -42,12 +58,56 @@ class Account:
         self._api: FamilySafetyAPI = api
         self.account_balance: float = 0.0
         self.account_currency: str = ""
+        self.roster_errors: dict = {}
 
     async def update(self) -> None:
-        """Update all account details."""
-        await self.get_screentime_usage()
-        coros = [self._get_devices(), self._get_overrides(), self._get_applications(), self._get_account_balance()]
-        await asyncio.gather(*coros)
+        """Update all account details, tolerating per-endpoint roster failures.
+
+        Each of the five sub-requests is wrapped individually so that a
+        stale-roster HttpException on one endpoint (e.g. from an Entra ID /
+        MDM-managed device) does not abort the entire account.  The account
+        remains in the accounts list with whatever partial data was retrieved.
+        Failed endpoints are recorded in self.roster_errors and the user_id is
+        appended to api.unresolvable_devices.
+        """
+        self.roster_errors = {}
+
+        async def _guarded(endpoint: str, coro) -> None:
+            """Await *coro*, silently tolerating stale-roster HttpException."""
+            try:
+                await coro
+            except HttpException as err:
+                text = str(err)
+                if not any(m in text.lower() for m in _STALE_ROSTER_MARKERS):
+                    raise
+                self.roster_errors[endpoint] = text[:200]
+                key = (str(self.user_id), endpoint)
+                _LOGGER.log(
+                    logging.DEBUG if key in _ROSTER_WARNED else logging.WARNING,
+                    "Roster resolution error for account %s (%s) — device may be "
+                    "enrolled in Entra ID/MDM or decommissioned. Skipping this endpoint.",
+                    self.user_id,
+                    endpoint,
+                )
+                _ROSTER_WARNED.add(key)
+                if self.user_id not in self._api.unresolvable_devices:
+                    self._api.unresolvable_devices.append(self.user_id)
+
+        await _guarded("screentime_usage", self.get_screentime_usage())
+        if self.screentime_usage is None:
+            self.screentime_usage = _empty_screentime_report()
+        if self.application_usage is None:
+            self.application_usage = {"appActivity": []}
+        await asyncio.gather(
+            _guarded("devices", self._get_devices()),
+            _guarded("overrides", self._get_overrides()),
+            _guarded("applications", self._get_applications()),
+            _guarded("spending", self._get_account_balance()),
+        )
+        if self.devices is None:
+            self.devices = []
+        if self.blocked_platforms is None:
+            self.blocked_platforms = []
 
     async def _get_devices(self) -> list[Device]:
         """Returns all devices on the account."""
@@ -197,20 +257,6 @@ class Account:
                     self.first_name = member.get("user").get("firstName")
                     self.surname = member.get("user").get("lastName")
                     self.experimental = experimental
-                    try:
-                        await self.update()
-                        response.append(self)
-                    except HttpException as exc:
-                        if any(marker in str(exc).lower() for marker in _STALE_ROSTER_MARKERS):
-                            _LOGGER.warning(
-                                "Roster resolution error for account %s — device may be "
-                                "enrolled in Entra ID/MDM or decommissioned. Skipping this "
-                                "account.",
-                                self.user_id
-                            )
-                            if self.user_id not in api.unresolvable_devices:
-                                api.unresolvable_devices.append(self.user_id)
-                        else:
-                            raise
-
+                    await self.update()
+                    response.append(self)
         return response

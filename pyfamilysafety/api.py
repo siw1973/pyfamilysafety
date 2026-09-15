@@ -13,11 +13,6 @@ from .exceptions import HttpException, AggregatorException, Unauthorized, Reques
 
 _LOGGER = logging.getLogger(__name__)
 
-_STALE_ROSTER_MARKERS = (
-    "unabletofindtargetresource",
-    "rostererror",
-    "unable to find the node",
-)
 
 def _check_http_success(status: int) -> bool:
     return status >= 200 and status < 300
@@ -49,26 +44,17 @@ class FamilySafetyAPI:
         return len(self.unresolvable_devices) > 0
 
     async def async_get_accounts(self):
-        """Fetch accounts, suppressing stale-roster errors from Entra ID / MDM devices."""
-        try:
-            return await self.send_request("get_accounts")
-        except HttpException as exc:
-            text = str(exc).lower()
-            if any(marker in text for marker in _STALE_ROSTER_MARKERS):
-                _LOGGER.warning(
-                    "Roster resolution error suppressed in async_get_accounts. "
-                    "This is expected when Entra ID or MDM-managed devices are present "
-                    "in the family roster. Returning empty member list."
-                )
-                if "unresolvable_roster_entry" not in self.unresolvable_devices:
-                    self.unresolvable_devices.append("unresolvable_roster_entry")
-                return {
-                    "status": 200,
-                    "text": '{"members": []}',
-                    "json": {"members": []},
-                    "headers": {},
-                }
-            raise
+        """Fetch the family roster.
+
+        Stale-roster errors are intentionally not caught here.  A roster-level
+        failure means Microsoft cannot build the member list at all and the
+        caller (e.g. the HA coordinator) should surface the error to the user
+        (typically with a message asking them to remove the decommissioned
+        device at account.microsoft.com/family).  Per-endpoint failures that
+        occur while fetching data for individual members are handled inside
+        Account.update() instead.
+        """
+        return await self.send_request("get_accounts")
 
     async def end_session(self):
         """Ends the active session, this method should be called before GC."""
