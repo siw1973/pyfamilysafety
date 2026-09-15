@@ -2,6 +2,7 @@
 """pyfamilysafety API request handler."""
 
 import logging
+from datetime import datetime
 
 import aiohttp
 import aiohttp.client_exceptions
@@ -12,18 +13,11 @@ from .exceptions import HttpException, AggregatorException, Unauthorized, Reques
 
 _LOGGER = logging.getLogger(__name__)
 
-# Error text fragments (lowercased) that indicate a family-roster entry
-# references a device Microsoft cannot resolve — typically an Entra ID /
-# school MDM enrolment or a decommissioned device that was never removed
-# from the roster.  When any of these appear in a HttpException raised by
-# get_accounts, the call is suppressed and an empty member list is returned
-# so callers can continue with partial data.
 _STALE_ROSTER_MARKERS = (
     "unabletofindtargetresource",
     "rostererror",
     "unable to find the node",
 )
-
 
 def _check_http_success(status: int) -> bool:
     return status >= 200 and status < 300
@@ -31,21 +25,54 @@ def _check_http_success(status: int) -> bool:
 class FamilySafetyAPI:
     """The API."""
 
-    def __init__(self, auth: Authenticator) -> None:
+    def __init__(self) -> None:
         """Init API."""
-        self._auth: Authenticator = auth
-        self.pending_requests = []
-        # Populated when async_get_accounts() catches a stale-roster error.
-        # Contains sentinel strings (not resolvable device IDs — Microsoft
-        # does not report which device caused the failure).  Non-empty means
-        # at least one roster entry is unresolvable; callers can surface a
-        # Repairs / notification to the user.
+        self.authenticator: Authenticator = None
+        self._session: aiohttp.ClientSession = aiohttp.ClientSession()
         self.unresolvable_devices: list[str] = []
+
+    @classmethod
+    async def create(cls, token: str, use_refresh_token: bool=False) -> 'FamilySafetyAPI':
+        """Create an instance of the base API handler library."""
+        self = cls()
+        self.authenticator = await Authenticator.create(token, use_refresh_token)
+        return self
+
+    @property
+    def _auth_token(self) -> str:
+        """Returns the auth token."""
+        return f"MSAuth1.0 usertoken=\"{self.authenticator.access_token}\", type=\"MSACT\""
 
     @property
     def has_unresolvable_devices(self) -> bool:
-        """True when the last get_accounts call hit a stale-roster error."""
+        """Returns True if there are unresolvable devices in the roster."""
         return len(self.unresolvable_devices) > 0
+
+    async def async_get_accounts(self):
+        """Fetch accounts, suppressing stale-roster errors from Entra ID / MDM devices."""
+        try:
+            return await self.send_request("get_accounts")
+        except HttpException as exc:
+            text = str(exc).lower()
+            if any(marker in text for marker in _STALE_ROSTER_MARKERS):
+                _LOGGER.warning(
+                    "Roster resolution error suppressed in async_get_accounts. "
+                    "This is expected when Entra ID or MDM-managed devices are present "
+                    "in the family roster. Returning empty member list."
+                )
+                if "unresolvable_roster_entry" not in self.unresolvable_devices:
+                    self.unresolvable_devices.append("unresolvable_roster_entry")
+                return {
+                    "status": 200,
+                    "text": '{"members": []}',
+                    "json": {"members": []},
+                    "headers": {},
+                }
+            raise
+
+    async def end_session(self):
+        """Ends the active session, this method should be called before GC."""
+        await self._session.close()
 
     async def send_request(self, endpoint: str, body: object=None, headers: dict=None, platform: str=None, **kwargs):
         """Sends a request to a given endpoint."""
@@ -55,15 +82,29 @@ class FamilySafetyAPI:
         if e_point is None:
             raise ValueError("Endpoint does not exist")
         # refresh the token if it has expired.
-        if self._auth.access_token_expired:
-            _LOGGER.debug("Token refresh required before continuing")
-            await self._auth.perform_refresh()
+        if self.authenticator.expires is not None:
+            if self.authenticator.expires < datetime.now():
+                _LOGGER.debug("Token refresh required before continuing")
+                await self.authenticator.perform_refresh()
+                self._session.headers.pop("Authorization")
 
+        if self.authenticator.expires is None:
+            _LOGGER.warning("Missing expiration of access token in authenticator, attempting to refresh anyway.")
+            await self.authenticator.perform_refresh()
+            try:
+                self._session.headers.pop("Authorization")
+            except KeyError:
+                pass
+
+        if self._session.headers.get("Authorization", None) is None:
+            # Add the auth token
+            self._session.headers.add("Authorization", self._auth_token)
+        # add headers to override
         if headers is None:
             headers = {}
-        headers["Authorization"] = self._auth.access_token
-        headers["User-Agent"] = USER_AGENT
-        headers["Content-Type"] = "application/json"
+            headers["Authorization"] = self._auth_token
+            headers["User-Agent"] = USER_AGENT
+            headers["Content-Type"] = "application/json"
         if platform is not None:
             headers["Plat-Info"] = platform
 
@@ -81,7 +122,7 @@ class FamilySafetyAPI:
             "json": "",
             "headers": ""
         }
-        async with self._auth.client_session.request(
+        async with self._session.request(
             method=e_point.get("method"),
             url=url,
             json=body,
@@ -104,191 +145,9 @@ class FamilySafetyAPI:
                 if response.status == 401:
                     raise Unauthorized()
                 if response.status == 403:
-                    raise RequestDenied(text)
+                    raise RequestDenied(await response.text())
 
-                raise HttpException("HTTP Error", response.status, text)
+                raise HttpException("HTTP Error", response.status, await response.text())
 
         # now return the resp dict
         return resp
-
-    async def async_get_accounts(self):
-        """Retrieve data from endpoint get_accounts.
-
-        Tolerates roster entries that Microsoft cannot resolve (e.g. devices
-        enrolled in an Entra ID / school MDM tenant, or decommissioned
-        devices still present in the family roster).  When such an error is
-        detected the exception is suppressed, ``unresolvable_devices`` is
-        updated, and an empty-members response dict is returned so the caller
-        can continue with partial data rather than failing entirely.
-
-        To resolve the underlying issue, remove the unresolvable device from
-        the family at https://account.microsoft.com/family.
-        """
-        try:
-            return await self.send_request("get_accounts")
-        except HttpException as exc:
-            text = str(exc).lower()
-            if any(marker in text for marker in _STALE_ROSTER_MARKERS):
-                _LOGGER.warning(
-                    "Roster resolution error suppressed in async_get_accounts. "
-                    "One or more devices in the family roster cannot be resolved "
-                    "by Microsoft (likely enrolled in an Entra ID / school MDM "
-                    "tenant, or a decommissioned device that was not removed from "
-                    "the roster). Returning an empty member list so the caller can "
-                    "continue with partial data. To fix this, remove the "
-                    "unresolvable device at https://account.microsoft.com/family"
-                )
-                # Microsoft does not report which device caused the failure, so
-                # we record a sentinel rather than a real device identifier.
-                if "unresolvable_roster_entry" not in self.unresolvable_devices:
-                    self.unresolvable_devices.append("unresolvable_roster_entry")
-                return {
-                    "status": 200,
-                    "text": '{"members": []}',
-                    "json": {"members": []},
-                    "headers": {},
-                }
-            raise
-
-    async def async_get_pending_requests(self):
-        """Retrieve data from endpoint get_pending_requests."""
-        return await self.send_request("get_pending_requests")
-
-    async def async_get_premium_entitlement(self):
-        """Retrieve data from endpoint get_premium_entitlement."""
-        return await self.send_request("get_premium_entitlement")
-
-    async def async_get_user_app_screentime_usage(
-            self,
-            user_id,
-            begin_time,
-            end_time,
-            platform
-        ):
-        """Retrieve data from endpoint get_user_app_screentime_usage."""
-        return await self.send_request(
-            "get_user_app_screentime_usage",
-            headers={
-                "Plat-Info": platform
-            },
-            USER_ID=user_id,
-            BEGIN_TIME=begin_time,
-            END_TIME=end_time
-        )
-
-    async def async_get_user_device_screentime_usage(
-            self,
-            user_id,
-            begin_time,
-            end_time,
-            device_count,
-            platform
-        ):
-        """Retrieve data from endpoint get_user_device_screentime_usage."""
-        return await self.send_request(
-            "get_user_device_screentime_usage",
-            headers={
-                "Plat-Info": platform
-            },
-            USER_ID=user_id,
-            BEGIN_TIME=begin_time,
-            END_TIME=end_time,
-            DEVICE_COUNT=device_count,
-        )
-
-    async def async_get_user_devices(self, user_id):
-        """Retrieve data from endpoint get_user_devices."""
-        return await self.send_request("get_user_devices", USER_ID=user_id)
-
-    async def async_get_user_spending(self, user_id):
-        """Retrieve data from endpoint get_user_spending."""
-        return await self.send_request("get_user_spending", USER_ID=user_id)
-
-    async def async_get_user_payment_methods(self, user_id, cid):
-        """Retrieve data from endpoint get_user_payment_methods."""
-        return await self.send_request("get_user_payment_methods", USER_ID=user_id, CID=cid)
-
-    async def async_get_user_content_restrictions(self, user_id):
-        """Retrieve data from endpoint get_user_content_restrictions."""
-        return await self.send_request("get_user_content_restrictions", USER_ID=user_id)
-
-    async def async_get_user_web_restrictions(self, user_id):
-        """Retrieve data from endpoint get_user_web_restrictions."""
-        return await self.send_request("get_user_web_restrictions", USER_ID=user_id)
-
-    async def async_update_web_restrictions(self, user_id, body):
-        """Send a PATCH request to update web restrictions."""
-        return await self.send_request("update_web_restrictions", USER_ID=user_id, body=body)
-
-    async def async_get_override_device_restrictions(self, user_id):
-        """Send a GET request to override device restrictions."""
-        return await self.send_request(
-            "get_override_device_restrictions",
-            USER_ID=user_id,
-            platform="ALL",
-        )
-
-    async def async_process_pending_request(
-            self,
-            request: dict,
-            approved: bool,
-            extension_time: int=0
-    ):
-        """Process a pending request using the deny and approve pending request method"""
-        if approved:
-            return await self.async_approve_pending_request(
-                body={
-                    "id": request.get("id"),
-                    "request": {
-                        "appId": request.get("id"),
-                        "extension": extension_time,
-                        "isGlobal": True,
-                        "lockTime": request.get("lockTime"),
-                        "platform": request.get("platform"),
-                        "requestedTime": request.get("requestedTime")
-                    },
-                    "type": request.get("type")
-                },
-                user_id=request["puid"]
-            )
-        return await self.async_deny_pending_request(
-            body={
-                "id": request.get("id"),
-                "request": {
-                    "appId": request.get("id"),
-                    "extension": extension_time,
-                    "isGlobal": True,
-                    "lockTime": request.get("lockTime"),
-                    "platform": request.get("platform"),
-                    "requestedTime": request.get("requestedTime")
-                },
-                "type": request.get("type")
-            },
-            user_id=request["puid"]
-        )
-
-    async def async_deny_pending_request(self, user_id, body):
-        """Send a POST request to deny a pending request."""
-        return await self.send_request("deny_pending_request", USER_ID=user_id, body=body)
-
-    async def async_approve_pending_request(self, user_id, body):
-        """Send a POST request to approve a pending request."""
-        return await self.send_request("approve_pending_request", USER_ID=user_id, body=body)
-
-    async def async_override_device_restriction(self, user_id, body):
-        """Send a POST request to override device restrictions."""
-        return await self.send_request(
-            "override_device_restriction",
-            USER_ID=user_id,
-            body=body,
-            platform="ALL",
-        )
-
-    async def async_update_schedule(self, user_id, body):
-        """Send a PATCH request to update device limits for a platform.
-
-        Prefer :meth:`~pyfamilysafety.account.Account.set_device_limits` with a
-        :class:`~pyfamilysafety.schedule.DeviceLimitsSchedule` instead of
-        calling this directly.
-        """
-        return await self.send_request("update_schedule", USER_ID=user_id, body=body)
